@@ -5,6 +5,7 @@ repo="${AGENT_BRIDGE_REPO:-BlueYeoul/agent-bridge}"
 version="${AGENT_BRIDGE_VERSION:-latest}"
 install_dir="${AGENT_BRIDGE_INSTALL_DIR:-$HOME/.local/bin}"
 binary_name="agent-bridge"
+module_path="github.com/$repo/cmd/agent-bridge"
 
 need() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -15,7 +16,6 @@ need() {
 
 need uname
 need mkdir
-need tar
 
 if command -v curl >/dev/null 2>&1; then
   download() { curl -fsSL "$1" -o "$2"; }
@@ -53,18 +53,44 @@ else
   archive="agent-bridge_${os}_${arch}.tar.gz"
 fi
 
-if [ "$version" = "latest" ]; then
-  url="https://github.com/$repo/releases/latest/download/$archive"
-else
-  url="https://github.com/$repo/releases/download/$version/$archive"
+install_from_source() {
+  if ! command -v go >/dev/null 2>&1; then
+    echo "agent-bridge installer: release binary was not available and Go is not installed" >&2
+    echo "agent-bridge installer: publish a GitHub Release or install Go, then retry" >&2
+    return 1
+  fi
+
+  mkdir -p "$install_dir"
+  echo "agent-bridge installer: building from source with go install"
+  GOBIN="$install_dir" go install "$module_path@$version"
+}
+
+install_from_release() {
+  if ! command -v tar >/dev/null 2>&1; then
+    echo "agent-bridge installer: tar is required for release archives" >&2
+    return 1
+  fi
+
+  if [ "$version" = "latest" ]; then
+    url="https://github.com/$repo/releases/latest/download/$archive"
+  else
+    url="https://github.com/$repo/releases/download/$version/$archive"
+  fi
+
+  echo "agent-bridge installer: downloading $url"
+  if ! download "$url" "$tmp_dir/$archive"; then
+    return 1
+  fi
+
+  mkdir -p "$install_dir"
+  tar -xzf "$tmp_dir/$archive" -C "$tmp_dir"
+  install -m 0755 "$tmp_dir/$binary_name" "$install_dir/$binary_name"
+}
+
+if ! install_from_release; then
+  echo "agent-bridge installer: release binary unavailable; falling back to source install"
+  install_from_source
 fi
-
-echo "agent-bridge installer: downloading $url"
-download "$url" "$tmp_dir/$archive"
-
-mkdir -p "$install_dir"
-tar -xzf "$tmp_dir/$archive" -C "$tmp_dir"
-install -m 0755 "$tmp_dir/$binary_name" "$install_dir/$binary_name"
 
 echo "agent-bridge installer: installed $install_dir/$binary_name"
 case ":$PATH:" in

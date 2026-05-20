@@ -16,7 +16,7 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/BlueYeoul/agent-bridge/main/install.ps1 | iex
 ```
 
-The installer downloads the latest prebuilt binary from GitHub Releases and installs it into `~/.local/bin`.
+The installer downloads the latest prebuilt binary from GitHub Releases and installs it into `~/.local/bin`. If a release binary is not available yet, it falls back to `go install` when Go is installed.
 
 To install from another fork:
 
