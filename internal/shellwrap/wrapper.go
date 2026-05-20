@@ -116,7 +116,7 @@ func RunCommand(command string, stdin io.Reader, stdout io.Writer, stderr io.Wri
 	remoteCommand := "cd " + sshx.ShellQuote(cfg.RemoteRoot) + " && " + translated
 	code, runErr := cfg.SSH().Run(remoteCommand, stdin, stdout, stderr)
 
-	if err := remotesync.Download(cfg.SSH(), cfg.WorkspacePath, cfg.RemoteRoot, cfg.StatePath); err != nil {
+	if err := remotesync.DownloadChanges(cfg.SSH(), cfg.WorkspacePath, cfg.RemoteRoot, cfg.StatePath); err != nil {
 		fmt.Fprintf(stderr, "agent-bridge shell: sync download failed: %v\n", err)
 		if runErr == nil && code == 0 {
 			return 1
@@ -145,7 +145,7 @@ func RunGitShim(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writ
 	}
 	code, runErr := cfg.SSH().Run(strings.Join(parts, " "), stdin, stdout, stderr)
 
-	if err := remotesync.Download(cfg.SSH(), cfg.WorkspacePath, cfg.RemoteRoot, cfg.StatePath); err != nil {
+	if err := remotesync.DownloadChanges(cfg.SSH(), cfg.WorkspacePath, cfg.RemoteRoot, cfg.StatePath); err != nil {
 		fmt.Fprintf(stderr, "agent-bridge git: sync download failed: %v\n", err)
 		if runErr == nil && code == 0 {
 			return 1

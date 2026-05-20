@@ -2,6 +2,7 @@ package remotesync
 
 import (
 	"archive/tar"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -13,6 +14,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -34,12 +36,40 @@ type State struct {
 }
 
 const (
-	stateLockPoll    = 25 * time.Millisecond
-	stateLockStale   = 30 * time.Minute
-	stateLockTimeout = 10 * time.Minute
+	stateLockPoll     = 25 * time.Millisecond
+	stateLockStale    = 30 * time.Minute
+	stateLockTimeout  = 10 * time.Minute
+	maxMirrorFileSize = 5 * 1024 * 1024
 )
 
 var inProcessStateLocks sync.Map
+
+var ExcludedDirs = []string{
+	".git",
+	".cache",
+	".venv",
+	"venv",
+	".gocache",
+	"node_modules",
+	".agtbge",
+	"data",
+	"dataset",
+	"datasets",
+	"outputs",
+	"checkpoints",
+	"runs",
+	"wandb",
+	"mlruns",
+}
+
+func isExcluded(name string) bool {
+	for _, dir := range ExcludedDirs {
+		if name == dir {
+			return true
+		}
+	}
+	return false
+}
 
 func Download(cfg sshx.Config, workspace, remoteRoot, statePath string) error {
 	if err := sshx.RequireFields(cfg); err != nil {
@@ -52,25 +82,14 @@ func Download(cfg sshx.Config, workspace, remoteRoot, statePath string) error {
 		return err
 	}
 
-	remoteCommand := "cd " + sshx.ShellQuote(remoteRoot) + " && tar -cf - ."
-	cmd := cfg.Command(remoteCommand)
-	stdout, err := cmd.StdoutPipe()
+	remote, err := RemoteSnapshot(cfg, remoteRoot)
 	if err != nil {
-		return fmt.Errorf("open remote tar stream: %w", err)
+		return err
 	}
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start remote tar download: %w", err)
-	}
-
-	extractErr := extractTar(stdout, workspace)
-	waitErr := cmd.Wait()
-	if extractErr != nil {
-		return extractErr
-	}
-	if waitErr != nil {
-		return fmt.Errorf("download remote workspace: %w: %s", waitErr, strings.TrimSpace(stderr.String()))
+	projected := ProjectMirrorState(remote)
+	rels := sortedStatePaths(projected)
+	if err := downloadTar(cfg, workspace, remoteRoot, rels); err != nil {
+		return err
 	}
 
 	state, err := Snapshot(workspace)
@@ -79,6 +98,39 @@ func Download(cfg sshx.Config, workspace, remoteRoot, statePath string) error {
 	}
 	return withStateLock(statePath, func() error {
 		return saveStateUnlocked(statePath, state)
+	})
+}
+
+func DownloadChanges(cfg sshx.Config, workspace, remoteRoot, statePath string) error {
+	if err := sshx.RequireFields(cfg); err != nil {
+		return err
+	}
+	return withStateLock(statePath, func() error {
+		previous, err := LoadState(statePath)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		remote, err := RemoteSnapshot(cfg, remoteRoot)
+		if err != nil {
+			return err
+		}
+		remote = ProjectMirrorState(remote)
+		changed, deleted := DiffRemote(previous, remote)
+		if len(deleted) > 0 {
+			if err := deleteLocal(workspace, deleted); err != nil {
+				return err
+			}
+		}
+		if len(changed) > 0 {
+			if err := downloadTar(cfg, workspace, remoteRoot, changed); err != nil {
+				return err
+			}
+		}
+		current, err := Snapshot(workspace)
+		if err != nil {
+			return err
+		}
+		return saveStateUnlocked(statePath, current)
 	})
 }
 
@@ -115,6 +167,26 @@ func uploadChangesUnlocked(cfg sshx.Config, workspace, remoteRoot, statePath str
 	return saveStateUnlocked(statePath, current)
 }
 
+func ProjectMirrorState(state State) State {
+	projected := State{Entries: map[string]Entry{}}
+	for rel, entry := range state.Entries {
+		if entry.Type == "file" && entry.Size > maxMirrorFileSize {
+			continue
+		}
+		projected.Entries[rel] = entry
+	}
+	return projected
+}
+
+func sortedStatePaths(state State) []string {
+	rels := make([]string, 0, len(state.Entries))
+	for rel := range state.Entries {
+		rels = append(rels, rel)
+	}
+	sort.Strings(rels)
+	return rels
+}
+
 func Diff(previous, current State) (changed []string, deleted []string) {
 	if previous.Entries == nil {
 		previous.Entries = map[string]Entry{}
@@ -138,6 +210,42 @@ func Diff(previous, current State) (changed []string, deleted []string) {
 	return changed, deleted
 }
 
+func DiffRemote(previous, remote State) (changed []string, deleted []string) {
+	if previous.Entries == nil {
+		previous.Entries = map[string]Entry{}
+	}
+	if remote.Entries == nil {
+		remote.Entries = map[string]Entry{}
+	}
+	for rel, cur := range remote.Entries {
+		prev, ok := previous.Entries[rel]
+		if !ok || !sameRemoteEntry(prev, cur) {
+			changed = append(changed, rel)
+			if ok && prev.Type != cur.Type {
+				deleted = append(deleted, rel)
+			}
+		}
+	}
+	for rel := range previous.Entries {
+		if _, ok := remote.Entries[rel]; !ok {
+			deleted = append(deleted, rel)
+		}
+	}
+	sort.Strings(changed)
+	sort.Strings(deleted)
+	return changed, deleted
+}
+
+func sameRemoteEntry(previous, remote Entry) bool {
+	if previous.Type != remote.Type || previous.Size != remote.Size || previous.Mode != remote.Mode || previous.Link != remote.Link {
+		return false
+	}
+	if remote.ModTime == 0 || previous.ModTime == 0 {
+		return true
+	}
+	return previous.ModTime/int64(time.Second) == remote.ModTime/int64(time.Second)
+}
+
 func Snapshot(root string) (State, error) {
 	entries := map[string]Entry{}
 	err := filepath.WalkDir(root, func(filePath string, d fs.DirEntry, walkErr error) error {
@@ -146,6 +254,9 @@ func Snapshot(root string) (State, error) {
 		}
 		if filePath == root {
 			return nil
+		}
+		if d.IsDir() && isExcluded(d.Name()) {
+			return filepath.SkipDir
 		}
 
 		rel, err := filepath.Rel(root, filePath)
@@ -195,6 +306,73 @@ func Snapshot(root string) (State, error) {
 		return State{}, fmt.Errorf("scan workspace: %w", err)
 	}
 	return State{Entries: entries}, nil
+}
+
+func RemoteSnapshot(cfg sshx.Config, remoteRoot string) (State, error) {
+	if err := sshx.RequireFields(cfg); err != nil {
+		return State{}, err
+	}
+	cmd := cfg.Command(remoteManifestCommand(remoteRoot))
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	output, err := cmd.Output()
+	if err != nil {
+		return State{}, fmt.Errorf("scan remote workspace: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return parseRemoteManifest(output)
+}
+
+func remoteManifestCommand(remoteRoot string) string {
+	var prunes []string
+	for _, dir := range ExcludedDirs {
+		prunes = append(prunes, "-name "+sshx.ShellQuote(dir))
+	}
+	pruneExpr := strings.Join(prunes, " -o ")
+	return "cd " + sshx.ShellQuote(remoteRoot) + " && find . \\( " + pruneExpr + " \\) -prune -o \\( -type f -o -type d -o -type l \\) -printf '%P\\0%y\\0%s\\0%m\\0%T@\\0%l\\0'"
+}
+
+func parseRemoteManifest(data []byte) (State, error) {
+	parts := bytes.Split(data, []byte{0})
+	entries := map[string]Entry{}
+	for i := 0; i+5 < len(parts); i += 6 {
+		rel := string(parts[i])
+		if rel == "" {
+			continue
+		}
+		if !safeRelativePath(rel) {
+			return State{}, fmt.Errorf("unsafe remote path %q", rel)
+		}
+		typ := string(parts[i+1])
+		size, _ := strconv.ParseInt(string(parts[i+2]), 10, 64)
+		mode, _ := strconv.ParseInt(string(parts[i+3]), 10, 64)
+		modTime, err := parseRemoteModTime(string(parts[i+4]))
+		if err != nil {
+			return State{}, err
+		}
+		entry := Entry{Size: size, Mode: mode, ModTime: modTime, Link: string(parts[i+5])}
+		switch typ {
+		case "d":
+			entry.Type = "dir"
+			entry.Size = 0
+		case "f":
+			entry.Type = "file"
+		case "l":
+			entry.Type = "symlink"
+			entry.Size = 0
+		default:
+			continue
+		}
+		entries[rel] = entry
+	}
+	return State{Entries: entries}, nil
+}
+
+func parseRemoteModTime(raw string) (int64, error) {
+	seconds, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse remote mtime %q: %w", raw, err)
+	}
+	return int64(seconds * float64(time.Second)), nil
 }
 
 func LoadState(path string) (State, error) {
@@ -355,6 +533,40 @@ func extractTar(r io.Reader, root string) error {
 	}
 }
 
+func downloadTar(cfg sshx.Config, workspace, remoteRoot string, rels []string) error {
+	if len(rels) == 0 {
+		return nil
+	}
+	quoted := make([]string, 0, len(rels))
+	for _, rel := range rels {
+		if !safeRelativePath(rel) {
+			return fmt.Errorf("unsafe download path %q", rel)
+		}
+		quoted = append(quoted, sshx.ShellQuote(rel))
+	}
+	remoteCommand := "cd " + sshx.ShellQuote(remoteRoot) + " && tar -cf - -- " + strings.Join(quoted, " ")
+	cmd := cfg.Command(remoteCommand)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("open remote tar delta stream: %w", err)
+	}
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start remote delta download: %w", err)
+	}
+
+	extractErr := extractTar(stdout, workspace)
+	waitErr := cmd.Wait()
+	if extractErr != nil {
+		return extractErr
+	}
+	if waitErr != nil {
+		return fmt.Errorf("download changed files: %w: %s", waitErr, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
 func uploadTar(cfg sshx.Config, workspace, remoteRoot string, rels []string) error {
 	remoteCommand := "cd " + sshx.ShellQuote(remoteRoot) + " && tar -xf -"
 	cmd := cfg.Command(remoteCommand)
@@ -429,6 +641,22 @@ func writeTarEntries(tw *tar.Writer, workspace string, rels []string) error {
 			if err := file.Close(); err != nil {
 				return err
 			}
+		}
+	}
+	return nil
+}
+
+func deleteLocal(workspace string, rels []string) error {
+	for _, rel := range rels {
+		if !safeRelativePath(rel) {
+			return fmt.Errorf("unsafe local delete path %q", rel)
+		}
+		localPath := filepath.Join(workspace, filepath.FromSlash(rel))
+		if err := ensureInside(workspace, localPath); err != nil {
+			return err
+		}
+		if err := os.RemoveAll(localPath); err != nil {
+			return fmt.Errorf("delete local path %s: %w", rel, err)
 		}
 	}
 	return nil
@@ -516,6 +744,9 @@ func clearDirectory(root string) error {
 		return fmt.Errorf("read workspace: %w", err)
 	}
 	for _, entry := range entries {
+		if isExcluded(entry.Name()) {
+			continue
+		}
 		if err := os.RemoveAll(filepath.Join(root, entry.Name())); err != nil {
 			return fmt.Errorf("clear workspace: %w", err)
 		}

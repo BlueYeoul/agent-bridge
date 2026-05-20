@@ -1,6 +1,6 @@
 # agent-bridge
 
-`agent-bridge` is a zero-install CLI that lets a local coding agent work against a remote workspace through a local mirror and a command-translating shell wrapper.
+`agent-bridge` is a zero-install CLI that lets a local coding agent work against a remote workspace through a sparse local projection and a command-translating shell wrapper.
 
 ## Install
 
@@ -43,15 +43,17 @@ When `--port` is omitted, `ssh` uses its normal defaults, so SSH config aliases 
 
 1. Creates an isolated session under `~/.agtbge`.
 2. Opens one SSH ControlMaster socket for the target when the local SSH client supports it.
-3. Resolves the remote workspace path and downloads it into a local mirror under `~/.agtbge/mirrors/session_<id>/<target>/<remote_path>`.
+3. Resolves the remote workspace path and creates a sparse local projection under `~/.agtbge/mirrors/session_<id>/<target>/<remote_path>`.
 4. Uses the `agent-bridge` binary itself as the fake shell, so Windows does not need Bash or SSHFS.
 5. Launches the requested agent with `SHELL`, `PWD`, and `CWD` pointed at the local mirror.
 6. Before each intercepted command, uploads local edits to the remote host.
 7. Executes the translated command remotely through SSH.
-8. After each command, refreshes the local mirror from the remote host.
+8. After each command, reads a remote manifest and refreshes only changed projected files.
 9. On exit or signal, performs a final upload, closes the ControlMaster socket, and removes session files.
 
-The sync transport uses remote `tar` over SSH streams and Go's built-in archive handling locally. It does not require `sshfs`, FUSE, `rsync`, Bash, or local `tar`.
+The sync transport uses remote `find`/`tar` over SSH streams and Go's built-in archive handling locally. It does not require `sshfs`, FUSE, `rsync`, Bash, or local `tar`.
+
+The local projection is intentionally not a full clone of the remote workspace. Large-data directories such as `data`, `datasets`, `outputs`, `checkpoints`, `runs`, `wandb`, `mlruns`, `node_modules`, virtualenvs, and `.git` are skipped by default. Individual files larger than 5 MiB are also left on the remote host. Shell commands still run in the real remote workspace, so big data remains available to Python, training scripts, tests, and other remote commands without being copied to the local machine.
 
 If a Windows OpenSSH build does not support ControlMaster multiplexing, `agent-bridge` falls back to direct `ssh` execution instead of failing at startup.
 
