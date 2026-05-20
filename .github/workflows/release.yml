@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test ./...
+      - name: Build archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          build_tar() {
+            local goos="$1"
+            local goarch="$2"
+            local name="agent-bridge_${goos}_${goarch}"
+            GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "dist/agent-bridge" ./cmd/agent-bridge
+            tar -C dist -czf "dist/${name}.tar.gz" agent-bridge
+            rm -f dist/agent-bridge
+          }
+
+          build_zip() {
+            local goarch="$1"
+            local name="agent-bridge_windows_${goarch}"
+            GOOS=windows GOARCH="$goarch" CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "dist/agent-bridge.exe" ./cmd/agent-bridge
+            (cd dist && zip -q "${name}.zip" agent-bridge.exe)
+            rm -f dist/agent-bridge.exe
+          }
+
+          build_tar darwin amd64
+          build_tar darwin arm64
+          build_tar linux amd64
+          build_tar linux arm64
+          build_zip amd64
+          build_zip arm64
+
+          (cd dist && sha256sum agent-bridge_* > checksums.txt)
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
