@@ -25,6 +25,7 @@ type Config struct {
 	WorkspacePath  string
 	HomePath       string
 	StatePath      string
+	NodeFSShimPath string
 	RemoteRoot     string
 }
 
@@ -47,6 +48,9 @@ func ApplyEnv(env []string, cfg Config) []string {
 	env = upsertEnv(env, "AGENT_BRIDGE_HOME", cfg.HomePath)
 	env = upsertEnv(env, "AGENT_BRIDGE_STATE", cfg.StatePath)
 	env = upsertEnv(env, "AGENT_BRIDGE_REMOTE_ROOT", cfg.RemoteRoot)
+	if cfg.NodeFSShimPath != "" {
+		env = prependNodeRequire(env, cfg.NodeFSShimPath)
+	}
 	return env
 }
 
@@ -62,6 +66,213 @@ if [[ -n "${BASH_EXECUTION_STRING:-}" && -n "${AGENT_BRIDGE_BINARY:-}" ]]; then
 fi
 `, sshx.ShellQuote(bridgePath))
 	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func WriteNodeFSShim(dir string) (string, error) {
+	path := filepath.Join(dir, "node-fs-shim.cjs")
+	const script = `'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const childProcess = require('child_process');
+
+const remoteRootRaw = process.env.AGENT_BRIDGE_REMOTE_ROOT || '';
+const workspaceRaw = process.env.AGENT_BRIDGE_WORKSPACE || '';
+
+if (remoteRootRaw && workspaceRaw) {
+  const remoteRoot = trimSlash(toSlash(remoteRootRaw));
+  const workspace = trimSlash(toSlash(workspaceRaw));
+  const workspaceNative = fromSlash(workspace);
+  let logicalCwd = remoteRoot || '/';
+
+  function toSlash(value) {
+    return String(value).replace(/\\/g, '/');
+  }
+
+  function trimSlash(value) {
+    if (value === '/') return value;
+    return value.replace(/\/+$/g, '');
+  }
+
+  function fromSlash(value) {
+    return process.platform === 'win32' ? value.replace(/\//g, '\\') : value;
+  }
+
+  function stripDrive(value) {
+    return value.replace(/^[A-Za-z]:(?=\/)/, '');
+  }
+
+  function localizeString(value) {
+    const slashed = toSlash(value);
+    const noDrive = stripDrive(slashed);
+    if (noDrive === remoteRoot) {
+      return workspaceNative;
+    }
+    if (noDrive.startsWith(remoteRoot + '/')) {
+      return fromSlash(workspace + '/' + noDrive.slice(remoteRoot.length + 1));
+    }
+    return value;
+  }
+
+  function remoteizeString(value) {
+    const slashed = trimSlash(toSlash(value));
+    if (slashed === workspace) {
+      return remoteRoot;
+    }
+    if (slashed.startsWith(workspace + '/')) {
+      return remoteRoot + '/' + slashed.slice(workspace.length + 1);
+    }
+    return value;
+  }
+
+  function localizePath(value) {
+    if (typeof value === 'string') {
+      return localizeString(value);
+    }
+    return value;
+  }
+
+  function mapIndexes(args, indexes) {
+    const mapped = Array.prototype.slice.call(args);
+    for (const index of indexes) {
+      if (index < mapped.length) {
+        mapped[index] = localizePath(mapped[index]);
+      }
+    }
+    return mapped;
+  }
+
+  function wrapMethod(target, name, indexes) {
+    const original = target && target[name];
+    if (typeof original !== 'function') return;
+    target[name] = function agentBridgePathShim() {
+      return Reflect.apply(original, this, mapIndexes(arguments, indexes));
+    };
+  }
+
+  function wrapRealpath(target, name) {
+    const original = target && target[name];
+    if (typeof original !== 'function') return;
+    target[name] = function agentBridgeRealpathShim() {
+      const args = mapIndexes(arguments, [0]);
+      const last = args[args.length - 1];
+      if (typeof last === 'function') {
+        args[args.length - 1] = function(err, resolved) {
+          if (err) return last.apply(this, arguments);
+          return last.call(this, err, remoteizeString(resolved));
+        };
+      }
+      return Reflect.apply(original, this, args);
+    };
+  }
+
+  function wrapRealpathSync(target, name) {
+    const original = target && target[name];
+    if (typeof original !== 'function') return;
+    target[name] = function agentBridgeRealpathSyncShim() {
+      return remoteizeString(Reflect.apply(original, this, mapIndexes(arguments, [0])));
+    };
+  }
+
+  const onePath = [
+    'access', 'accessSync', 'appendFile', 'appendFileSync', 'chmod', 'chmodSync',
+    'chown', 'chownSync', 'createReadStream', 'createWriteStream', 'exists',
+    'existsSync', 'lchmod', 'lchmodSync', 'lchown', 'lchownSync', 'lstat',
+    'lstatSync', 'lutimes', 'lutimesSync', 'mkdir', 'mkdirSync', 'mkdtemp',
+    'mkdtempSync', 'open', 'openSync', 'opendir', 'opendirSync', 'readdir',
+    'readdirSync', 'readFile', 'readFileSync', 'readlink', 'readlinkSync',
+    'rm', 'rmSync', 'rmdir', 'rmdirSync', 'stat', 'statSync', 'statfs',
+    'statfsSync', 'truncate', 'truncateSync', 'unlink', 'unlinkSync',
+    'utimes', 'utimesSync', 'watch', 'watchFile', 'writeFile', 'writeFileSync'
+  ];
+  for (const name of onePath) wrapMethod(fs, name, [0]);
+
+  for (const name of ['copyFile', 'copyFileSync', 'cp', 'cpSync', 'link', 'linkSync', 'rename', 'renameSync']) {
+    wrapMethod(fs, name, [0, 1]);
+  }
+  for (const name of ['symlink', 'symlinkSync']) {
+    wrapMethod(fs, name, [1]);
+  }
+  wrapRealpath(fs, 'realpath');
+  wrapRealpathSync(fs, 'realpathSync');
+  if (fs.realpath && fs.realpath.native) wrapRealpath(fs.realpath, 'native');
+  if (fs.realpathSync && fs.realpathSync.native) wrapRealpathSync(fs.realpathSync, 'native');
+
+  if (fs.promises) {
+    for (const name of [
+      'access', 'appendFile', 'chmod', 'chown', 'copyFile', 'cp', 'lchmod',
+      'lchown', 'link', 'lstat', 'lutimes', 'mkdir', 'mkdtemp', 'open',
+      'opendir', 'readdir', 'readFile', 'readlink', 'rm', 'rename', 'rmdir',
+      'stat', 'statfs', 'symlink', 'truncate', 'unlink', 'utimes', 'writeFile'
+    ]) {
+      const indexes = ['copyFile', 'cp', 'link', 'rename'].includes(name) ? [0, 1] : (name === 'symlink' ? [1] : [0]);
+      wrapMethod(fs.promises, name, indexes);
+    }
+    const realpathPromise = fs.promises.realpath;
+    if (typeof realpathPromise === 'function') {
+      fs.promises.realpath = async function agentBridgeRealpathPromiseShim() {
+        const resolved = await Reflect.apply(realpathPromise, this, mapIndexes(arguments, [0]));
+        return remoteizeString(resolved);
+      };
+    }
+  }
+
+  const realCwd = process.cwd.bind(process);
+  const realChdir = process.chdir.bind(process);
+  process.cwd = function agentBridgeCwdShim() {
+    return logicalCwd;
+  };
+  process.chdir = function agentBridgeChdirShim(dir) {
+    const localized = localizeString(dir);
+    realChdir(localized);
+    const remote = stripDrive(toSlash(dir));
+    if (remote === remoteRoot || remote.startsWith(remoteRoot + '/')) {
+      logicalCwd = trimSlash(remote);
+    } else {
+      logicalCwd = remoteizeString(realCwd());
+    }
+  };
+
+  function mapChildOptions(options) {
+    if (!options || typeof options !== 'object' || !options.cwd) return options;
+    return Object.assign({}, options, { cwd: localizeString(options.cwd) });
+  }
+
+  function wrapChild(name, optionsIndex) {
+    const original = childProcess[name];
+    if (typeof original !== 'function') return;
+    childProcess[name] = function agentBridgeChildShim() {
+      const args = Array.prototype.slice.call(arguments);
+      if (optionsIndex < args.length) args[optionsIndex] = mapChildOptions(args[optionsIndex]);
+      return Reflect.apply(original, this, args);
+    };
+  }
+
+  wrapChild('spawn', 2);
+  wrapChild('spawnSync', 2);
+  wrapChild('execFile', 2);
+  wrapChild('execFileSync', 2);
+  wrapChild('fork', 2);
+
+  const exec = childProcess.exec;
+  if (typeof exec === 'function') {
+    childProcess.exec = function agentBridgeExecShim(command, options, callback) {
+      if (typeof options === 'function') return exec.call(this, command, options);
+      return exec.call(this, command, mapChildOptions(options), callback);
+    };
+  }
+  const execSync = childProcess.execSync;
+  if (typeof execSync === 'function') {
+    childProcess.execSync = function agentBridgeExecSyncShim(command, options) {
+      return execSync.call(this, command, mapChildOptions(options));
+    };
+  }
+}
+`
+	if err := os.WriteFile(path, []byte(script), 0o600); err != nil {
 		return "", err
 	}
 	return path, nil
@@ -307,6 +518,32 @@ func upsertEnv(env []string, key, value string) []string {
 		}
 	}
 	return append(env, prefix+value)
+}
+
+func prependNodeRequire(env []string, shimPath string) []string {
+	requireOpt := "--require=" + nodeOptionValue(shimPath)
+	for i, item := range env {
+		if strings.HasPrefix(item, "NODE_OPTIONS=") {
+			current := strings.TrimPrefix(item, "NODE_OPTIONS=")
+			if strings.Contains(current, shimPath) {
+				return env
+			}
+			if current == "" {
+				env[i] = "NODE_OPTIONS=" + requireOpt
+			} else {
+				env[i] = "NODE_OPTIONS=" + requireOpt + " " + current
+			}
+			return env
+		}
+	}
+	return append(env, "NODE_OPTIONS="+requireOpt)
+}
+
+func nodeOptionValue(value string) string {
+	if !strings.ContainsAny(value, " \t\"") {
+		return value
+	}
+	return `"` + strings.ReplaceAll(value, `"`, `\"`) + `"`
 }
 
 func boolString(v bool) string {

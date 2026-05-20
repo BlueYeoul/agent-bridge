@@ -96,6 +96,84 @@ func TestBashEnvShimInterceptsAbsoluteBash(t *testing.T) {
 	}
 }
 
+func TestApplyEnvInjectsNodeFSShim(t *testing.T) {
+	env := ApplyEnv([]string{"NODE_OPTIONS=--trace-warnings"}, Config{
+		BridgePath:     "/tmp/agent-bridge",
+		WorkspacePath:  "/tmp/work",
+		HomePath:       "/tmp",
+		StatePath:      "/tmp/state.json",
+		NodeFSShimPath: "/tmp/node-fs-shim.cjs",
+		RemoteRoot:     "/srv/app",
+	})
+	var got string
+	for _, item := range env {
+		if strings.HasPrefix(item, "NODE_OPTIONS=") {
+			got = item
+			break
+		}
+	}
+	if !strings.Contains(got, "--require=/tmp/node-fs-shim.cjs --trace-warnings") {
+		t.Fatalf("NODE_OPTIONS = %q", got)
+	}
+}
+
+func TestNodeFSShimMapsRemoteAbsolutePaths(t *testing.T) {
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not available")
+	}
+
+	dir := t.TempDir()
+	workspace := filepath.Join(dir, "mirror")
+	if err := os.MkdirAll(workspace, 0o700); err != nil {
+		t.Fatalf("mkdir workspace: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "pyproject.toml"), []byte("[project]\nname = \"demo\"\n"), 0o600); err != nil {
+		t.Fatalf("write pyproject: %v", err)
+	}
+	shimPath, err := WriteNodeFSShim(dir)
+	if err != nil {
+		t.Fatalf("WriteNodeFSShim() error = %v", err)
+	}
+
+	const script = `
+const fs = require('fs');
+const childProcess = require('child_process');
+const remoteRoot = process.env.AGENT_BRIDGE_REMOTE_ROOT;
+if (process.cwd() !== remoteRoot) {
+  throw new Error('cwd not virtualized: ' + process.cwd());
+}
+const data = fs.readFileSync(remoteRoot + '/pyproject.toml', 'utf8');
+if (!data.includes('name = "demo"')) {
+  throw new Error('readFileSync did not map remote path');
+}
+fs.accessSync(remoteRoot + '/pyproject.toml');
+const names = fs.readdirSync(remoteRoot);
+if (!names.includes('pyproject.toml')) {
+  throw new Error('readdirSync did not map remote path');
+}
+const childCwd = childProcess.execFileSync(process.execPath, ['-e', 'process.stdout.write(process.cwd())'], { cwd: remoteRoot }).toString();
+if (childCwd !== remoteRoot) {
+  throw new Error('child cwd not virtualized: ' + childCwd);
+}
+`
+	cmd := exec.Command(nodePath, "-e", script)
+	cmd.Dir = workspace
+	cmd.Env = ApplyEnv(os.Environ(), Config{
+		BridgePath:     "/tmp/agent-bridge",
+		WorkspacePath:  workspace,
+		HomePath:       dir,
+		StatePath:      filepath.Join(dir, "state.json"),
+		NodeFSShimPath: shimPath,
+		RemoteRoot:     "/home/perseverance/2026/test",
+	})
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("node shim failed: %v\n%s", err, stderr.String())
+	}
+}
+
 func TestRunFakeShellTranslatesWorkspacePath(t *testing.T) {
 	dir := t.TempDir()
 	workspace := filepath.Join(dir, "work_abcd")

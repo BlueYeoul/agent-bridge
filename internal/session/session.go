@@ -26,18 +26,19 @@ type Runner struct {
 	cfg cli.Config
 	out io.Writer
 
-	sessionID     string
-	home          string
-	baseDir       string
-	sessionDir    string
-	binDir        string
-	socketPath    string
-	workspaceRoot string
-	workspace     string
-	statePath     string
-	bridgePath    string
-	bashEnvPath   string
-	remoteRoot    string
+	sessionID      string
+	home           string
+	baseDir        string
+	sessionDir     string
+	binDir         string
+	socketPath     string
+	workspaceRoot  string
+	workspace      string
+	statePath      string
+	bridgePath     string
+	bashEnvPath    string
+	nodeFSShimPath string
+	remoteRoot     string
 
 	controlEnabled bool
 	masterStarted  bool
@@ -214,6 +215,11 @@ func (r *Runner) writeWrappers() error {
 		return fmt.Errorf("write bash env shim: %w", err)
 	}
 	r.bashEnvPath = bashEnvPath
+	nodeFSShimPath, err := shellwrap.WriteNodeFSShim(r.sessionDir)
+	if err != nil {
+		return fmt.Errorf("write node fs shim: %w", err)
+	}
+	r.nodeFSShimPath = nodeFSShimPath
 	return nil
 }
 
@@ -280,6 +286,7 @@ func (r *Runner) agentEnv() []string {
 		WorkspacePath:  r.workspace,
 		HomePath:       r.home,
 		StatePath:      r.statePath,
+		NodeFSShimPath: r.nodeFSShimPath,
 		RemoteRoot:     r.remoteRoot,
 	})
 	env = r.applyAgentProfileEnv(env)
@@ -364,24 +371,8 @@ func (r *Runner) profileLaunchArgs() []string {
 		if !hasArg(args, "--no-git") {
 			args = append([]string{"--no-git"}, args...)
 		}
-	case "pi":
-		args = append(args, "--append-system-prompt", r.agentBridgePrompt())
 	}
 	return args
-}
-
-func (r *Runner) agentBridgePrompt() string {
-	return fmt.Sprintf(`agent-bridge remote workspace mapping:
-- Canonical project directory: %s
-- SSH target: %s
-- Local mirror directory: %s
-Critical path rules:
-- File tools such as read, edit, list, search, or directory inspection run on the local machine, not on the SSH host.
-- When using file tools, always use "." or paths under the local mirror directory. Never pass the canonical remote absolute path to file tools.
-- Example: to read %s/pyproject.toml with a file tool, read ./pyproject.toml or %s/pyproject.toml.
-- Shell commands execute on the SSH target in the canonical project directory, so shell commands may use normal remote paths.
-- When speaking to the user, describe files as belonging to the canonical project directory and avoid exposing the local mirror unless debugging agent-bridge itself.
-The local mirror is a sparse projection of the remote workspace. Large data files and excluded directories may not exist locally, but they remain available to shell commands on the remote host.`, r.remoteRoot, r.cfg.Target, r.workspace, r.remoteRoot, r.workspace)
 }
 
 func hasArg(args []string, want string) bool {

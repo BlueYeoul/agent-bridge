@@ -34,22 +34,3 @@ func TestLocalMirrorPathIncludesTargetAndRemotePath(t *testing.T) {
 		t.Fatalf("localMirrorPath() = %q", got)
 	}
 }
-
-func TestAgentBridgePromptSeparatesFileToolAndRemotePaths(t *testing.T) {
-	r := &Runner{
-		cfg:        cli.Config{Target: "univ"},
-		remoteRoot: "/home/perseverance/2026/test",
-		workspace:  filepath.Join("/tmp", "agtbge", "mirrors", "session_abcd", "univ", "home", "perseverance", "2026", "test"),
-	}
-	prompt := r.agentBridgePrompt()
-	for _, want := range []string{
-		"File tools",
-		"Never pass the canonical remote absolute path",
-		"read ./pyproject.toml",
-		"Shell commands execute on the SSH target",
-	} {
-		if !strings.Contains(prompt, want) {
-			t.Fatalf("agentBridgePrompt() missing %q:\n%s", want, prompt)
-		}
-	}
-}

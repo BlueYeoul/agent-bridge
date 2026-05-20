@@ -63,8 +63,8 @@ For shell execution, `agent-bridge` uses multiple interception paths:
 
 - `SHELL` points at the bridge binary for agents that respect the environment.
 - `BASH_ENV` redirects non-interactive `/bin/bash -c ...` calls, including agents that hardcode Bash.
+- `NODE_OPTIONS=--require ...` injects a filesystem shim for Node-based agents so remote absolute paths are mapped to the local projection inside `fs`, `fs.promises`, `process.cwd()`, `process.chdir()`, and child process `cwd` options.
 - Known agent profiles can receive session-local settings; for `pi`, `shellPath` is set to the bridge binary without modifying the user's real `~/.pi/agent/settings.json`.
-- Known agents can receive an additional system prompt explaining that the canonical project directory is the remote path and the local mirror is an implementation detail.
 
 ## Profiles
 
