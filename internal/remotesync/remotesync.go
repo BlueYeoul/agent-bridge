@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/BlueYeoul/agent-bridge/internal/sshx"
@@ -31,6 +32,14 @@ type Entry struct {
 type State struct {
 	Entries map[string]Entry `json:"entries"`
 }
+
+const (
+	stateLockPoll    = 25 * time.Millisecond
+	stateLockStale   = 30 * time.Minute
+	stateLockTimeout = 10 * time.Minute
+)
+
+var inProcessStateLocks sync.Map
 
 func Download(cfg sshx.Config, workspace, remoteRoot, statePath string) error {
 	if err := sshx.RequireFields(cfg); err != nil {
@@ -68,13 +77,21 @@ func Download(cfg sshx.Config, workspace, remoteRoot, statePath string) error {
 	if err != nil {
 		return err
 	}
-	return SaveState(statePath, state)
+	return withStateLock(statePath, func() error {
+		return saveStateUnlocked(statePath, state)
+	})
 }
 
 func UploadChanges(cfg sshx.Config, workspace, remoteRoot, statePath string) error {
 	if err := sshx.RequireFields(cfg); err != nil {
 		return err
 	}
+	return withStateLock(statePath, func() error {
+		return uploadChangesUnlocked(cfg, workspace, remoteRoot, statePath)
+	})
+}
+
+func uploadChangesUnlocked(cfg sshx.Config, workspace, remoteRoot, statePath string) error {
 	previous, err := LoadState(statePath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -95,7 +112,7 @@ func UploadChanges(cfg sshx.Config, workspace, remoteRoot, statePath string) err
 			return err
 		}
 	}
-	return SaveState(statePath, current)
+	return saveStateUnlocked(statePath, current)
 }
 
 func Diff(previous, current State) (changed []string, deleted []string) {
@@ -196,6 +213,12 @@ func LoadState(path string) (State, error) {
 }
 
 func SaveState(path string, state State) error {
+	return withStateLock(path, func() error {
+		return saveStateUnlocked(path, state)
+	})
+}
+
+func saveStateUnlocked(path string, state State) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
@@ -203,11 +226,79 @@ func SaveState(path string, state State) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = os.Remove(tmpPath)
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
+func withStateLock(statePath string, fn func() error) error {
+	dir := filepath.Dir(statePath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+
+	lockPath := statePath + ".lock"
+	localLockAny, _ := inProcessStateLocks.LoadOrStore(lockPath, &sync.Mutex{})
+	localLock := localLockAny.(*sync.Mutex)
+	localLock.Lock()
+	defer localLock.Unlock()
+
+	deadline := time.Now().Add(stateLockTimeout)
+	for {
+		release, err := tryAcquireStateLock(lockPath)
+		if err == nil {
+			defer release()
+			return fn()
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return err
+		}
+		if lockIsStale(lockPath) {
+			_ = os.Remove(lockPath)
+			continue
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("sync state lock timeout: %s", lockPath)
+		}
+		time.Sleep(stateLockPoll)
+	}
+}
+
+func tryAcquireStateLock(lockPath string) (func(), error) {
+	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	_, _ = fmt.Fprintf(file, "pid=%d time=%s\n", os.Getpid(), time.Now().Format(time.RFC3339Nano))
+	if err := file.Close(); err != nil {
+		_ = os.Remove(lockPath)
+		return nil, err
+	}
+	return func() {
+		_ = os.Remove(lockPath)
+	}, nil
+}
+
+func lockIsStale(lockPath string) bool {
+	info, err := os.Stat(lockPath)
+	if err != nil {
+		return false
+	}
+	return time.Since(info.ModTime()) > stateLockStale
 }
 
 func extractTar(r io.Reader, root string) error {

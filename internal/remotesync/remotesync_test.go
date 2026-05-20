@@ -3,6 +3,7 @@ package remotesync
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -37,6 +38,38 @@ func TestSnapshotAndDiff(t *testing.T) {
 	}
 	if !contains(changed, "pkg/app.go") || !contains(changed, "README.md") {
 		t.Fatalf("changed = %v, want modified app.go and added README.md", changed)
+	}
+}
+
+func TestSaveStateConcurrentWriters(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "session", "state.json")
+	const writers = 16
+
+	var wg sync.WaitGroup
+	errs := make(chan error, writers)
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- SaveState(statePath, State{Entries: map[string]Entry{
+				"README.md": {Type: "file", Size: 12},
+			}})
+		}()
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("SaveState concurrent error = %v", err)
+		}
+	}
+	state, err := LoadState(statePath)
+	if err != nil {
+		t.Fatalf("LoadState error = %v", err)
+	}
+	if _, ok := state.Entries["README.md"]; !ok {
+		t.Fatalf("state entries = %v, want README.md", state.Entries)
 	}
 }
 

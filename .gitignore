@@ -1,4 +1,5 @@
 /agent-bridge
 /agent-bridge.exe
 /dist/
+/.gocache/
 .DS_Store
