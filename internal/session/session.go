@@ -375,7 +375,13 @@ func (r *Runner) agentBridgePrompt() string {
 - Canonical project directory: %s
 - SSH target: %s
 - Local mirror directory: %s
-The local mirror is an implementation detail. When the user asks for the project folder, current directory, workspace path, or what is visible in the project, report the canonical project directory, not the local mirror path. Filesystem tools operate on the mirror, but their contents represent the canonical remote workspace. Shell commands execute on the SSH target in the canonical project directory.`, r.remoteRoot, r.cfg.Target, r.workspace)
+Critical path rules:
+- File tools such as read, edit, list, search, or directory inspection run on the local machine, not on the SSH host.
+- When using file tools, always use "." or paths under the local mirror directory. Never pass the canonical remote absolute path to file tools.
+- Example: to read %s/pyproject.toml with a file tool, read ./pyproject.toml or %s/pyproject.toml.
+- Shell commands execute on the SSH target in the canonical project directory, so shell commands may use normal remote paths.
+- When speaking to the user, describe files as belonging to the canonical project directory and avoid exposing the local mirror unless debugging agent-bridge itself.
+The local mirror is a sparse projection of the remote workspace. Large data files and excluded directories may not exist locally, but they remain available to shell commands on the remote host.`, r.remoteRoot, r.cfg.Target, r.workspace, r.remoteRoot, r.workspace)
 }
 
 func hasArg(args []string, want string) bool {
