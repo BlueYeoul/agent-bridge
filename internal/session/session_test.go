@@ -12,6 +12,7 @@ func TestControlMasterUnsupported(t *testing.T) {
 	cases := []string{
 		"ControlMaster is unsupported on this platform",
 		"mux client is not supported",
+		"getsockname failed: Not a socket",
 	}
 	for _, tc := range cases {
 		if !controlMasterUnsupported(tc) {

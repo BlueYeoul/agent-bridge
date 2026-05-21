@@ -523,6 +523,9 @@ func controlMasterUnsupported(stderr string) bool {
 	if strings.Contains(msg, "mux") && (strings.Contains(msg, "not support") || strings.Contains(msg, "unsupported")) {
 		return true
 	}
+	if strings.Contains(msg, "getsockname failed") && strings.Contains(msg, "not a socket") {
+		return true
+	}
 	return false
 }
 
